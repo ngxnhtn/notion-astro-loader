@@ -1,20 +1,25 @@
-import type { RehypePlugins } from 'astro';
-import type { Loader } from 'astro/loaders';
+import type { RehypePlugins } from "astro";
+import type { LiveLoader, Loader } from "astro/loaders";
 
-import { Client, isFullPage, iteratePaginatedAPI } from '@notionhq/client';
-import { dim } from 'kleur/colors';
-import * as path from 'node:path';
+import { Client, isFullPage, iteratePaginatedAPI } from "@notionhq/client";
+import { dim } from "kleur/colors";
+import * as path from "node:path";
+import { zodToTs, printNode, createAuxiliaryTypeStore, createTypeAlias } from "zod-to-ts";
 
-import { propertiesSchemaForDatabase } from './database-properties.js';
-import { VIRTUAL_CONTENT_ROOT } from './image.js';
-import { buildProcessor, NotionPageRenderer, type RehypePlugin } from './render.js';
-import { notionPageSchema } from './schemas/page.js';
-import * as transformedPropertySchema from './schemas/transformed-properties.js';
-import type { ClientOptions, QueryDatabaseParameters } from './types.js';
+import { propertiesSchemaForDataSource } from "./database-properties.js";
+import { VIRTUAL_CONTENT_ROOT } from "./image.js";
+import { buildProcessor, NotionPageRenderer, type RehypePlugin } from "./render.js";
+import { notionPageSchema } from "./schemas/page.js";
+import * as transformedPropertySchema from "./schemas/transformed-properties.js";
+import type { ClientOptions, QueryDataSourcesParameters } from "./types.js";
 
 export interface NotionLoaderOptions
-  extends Pick<ClientOptions, 'auth' | 'timeoutMs' | 'baseUrl' | 'notionVersion' | 'fetch' | 'agent'>,
-    Pick<QueryDatabaseParameters, 'database_id' | 'filter_properties' | 'sorts' | 'filter' | 'archived'> {
+  extends
+    Pick<ClientOptions, "auth" | "timeoutMs" | "baseUrl" | "notionVersion" | "fetch" | "agent">,
+    Pick<
+      QueryDataSourcesParameters,
+      "data_source_id" | "filter_properties" | "sorts" | "filter" | "archived"
+    > {
   /**
    * Pass rehype plugins to customize how the Notion output HTML is processed.
    * You can import and apply the plugin function (recommended), or pass the plugin name as a string.
@@ -48,7 +53,7 @@ export interface NotionLoaderOptions
   experimentalRootSourceAlias?: string;
 }
 
-const DEFAULT_IMAGE_SAVE_PATH = 'assets/images/notion';
+const DEFAULT_IMAGE_SAVE_PATH = "assets/images/notion";
 
 /**
  * Notion loader for the Astro Content Layer API.
@@ -74,7 +79,7 @@ const DEFAULT_IMAGE_SAVE_PATH = 'assets/images/notion';
  * });
  */
 export function notionLoader({
-  database_id,
+  data_source_id,
   filter_properties,
   sorts,
   filter,
@@ -83,7 +88,7 @@ export function notionLoader({
   imageSavePath = DEFAULT_IMAGE_SAVE_PATH,
   rehypePlugins = [],
   experimentalCacheImageInData = false,
-  experimentalRootSourceAlias = 'src',
+  experimentalRootSourceAlias = "src",
   ...clientOptions
 }: NotionLoaderOptions): Loader {
   const notionClient = new Client(clientOptions);
@@ -98,20 +103,31 @@ export function notionLoader({
         plugin = config;
       }
 
-      if (typeof plugin === 'string') {
+      if (typeof plugin === "string") {
         plugin = (await import(/* @vite-ignore */ plugin)).default as RehypePlugin;
       }
       return [plugin, options] as const;
-    })
+    }),
   );
   const processor = buildProcessor(resolvedRehypePlugins);
 
   return {
-    name: collectionName ? `notion-loader/${collectionName}` : 'notion-loader',
-    schema: async () =>
-      notionPageSchema({
-        properties: await propertiesSchemaForDatabase(notionClient, database_id),
-      }),
+    name: collectionName ? `notion-loader/${collectionName}` : "notion-loader",
+    createSchema: async () => {
+      const schema = notionPageSchema({
+        properties: await propertiesSchemaForDataSource(notionClient, data_source_id),
+      });
+
+      const auxiliaryTypeStore = createAuxiliaryTypeStore();
+      const { node } = zodToTs(schema, { auxiliaryTypeStore });
+      const typeAlias = createTypeAlias(node, "Entry");
+      const types = printNode(typeAlias);
+
+      return {
+        schema,
+        types: `export ${types}`,
+      };
+    },
     async load(ctx) {
       const { store, logger: log_db, parseData } = ctx;
 
@@ -120,8 +136,8 @@ export function notionLoader({
 
       log_db.info(`Loading database ${dim(`found ${existingPageIds.size} pages in store`)}`);
 
-      const pages = iteratePaginatedAPI(notionClient.databases.query, {
-        database_id,
+      const pages = iteratePaginatedAPI(notionClient.dataSources.query, {
+        data_source_id,
         filter_properties,
         sorts,
         filter,
@@ -139,24 +155,26 @@ export function notionLoader({
         const log_pg = log_db.fork(`${log_db.label}/${page.id.slice(0, 6)}`);
 
         // Create metadata for logging
-        const titleProp = Object.entries(page.properties).find(([_, property]) => property.type === 'title');
+        const titleProp = Object.entries(page.properties).find(
+          ([_, property]) => property.type === "title",
+        );
         const pageTitle = transformedPropertySchema.title.safeParse(titleProp ? titleProp[1] : {});
         const pageMetadata = [
-          `${pageTitle.success ? '"' + pageTitle.data + '"' : 'Untitled'}`,
+          `${pageTitle.success ? '"' + pageTitle.data + '"' : "Untitled"}`,
           `(last edited ${page.last_edited_time.slice(0, 10)})`,
-        ].join(' ');
+        ].join(" ");
 
         const isCached = existingPageIds.delete(page.id);
         const existingPage = store.get(page.id);
 
         // If the page has been updated, re-render it
         if (existingPage?.digest !== page.last_edited_time) {
-          const realSavePath = path.resolve(process.cwd(), 'src', imageSavePath);
+          const realSavePath = path.resolve(process.cwd(), "src", imageSavePath);
 
           const renderer = new NotionPageRenderer(notionClient, page, realSavePath, log_pg);
 
           const data = await parseData(
-            await renderer.getPageData(experimentalCacheImageInData, experimentalRootSourceAlias)
+            await renderer.getPageData(experimentalCacheImageInData, experimentalRootSourceAlias),
           );
 
           const renderPromise = renderer.render(processor).then((rendered) => {
@@ -172,7 +190,7 @@ export function notionLoader({
 
           renderPromises.push(renderPromise);
 
-          log_pg.info(`${isCached ? 'Updated' : 'Created'} page ${dim(pageMetadata)}`);
+          log_pg.info(`${isCached ? "Updated" : "Created"} page ${dim(pageMetadata)}`);
         } else {
           log_pg.debug(`Skipped page ${dim(pageMetadata)}`);
         }
